@@ -3,6 +3,8 @@ Frame-by-frame video generation using SDXL img2img + ControlNet.
 
 Edit the configuration block below to change inputs, prompts, schedules,
 and output paths. No CLI parsing is used.
+
+Luke Dzwonczyk, Dec 2025
 """
 
 import random
@@ -14,6 +16,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+from diffusers import StableDiffusionXLImg2ImgPipeline, AutoencoderKL
 
 from experiments import load_pipeline
 
@@ -29,11 +32,11 @@ INPUTS = "media/inputs/google-earth"
 CONTROL_IMAGE = "media/inputs/canny/gingko.jpg"
 
 # Total frames to generate (applies to both single-image and folder modes).
-NUM_FRAMES = 88
+NUM_FRAMES = 8
 # google_earth has 88 images
 
 # Prompt settings.
-PROMPT = "highly detailed satellite image"
+PROMPT = "highly detailed satellite image with the outline of a gingko leaf in the center"
 NEGATIVE_PROMPT = "low quality, blurry, distorted"
 NUM_INFERENCE_STEPS = 30
 GUIDANCE_SCALE = 4.0
@@ -41,22 +44,28 @@ GUIDANCE_SCALE = 4.0
 # Parameter schedules for strength and ControlNet conditioning scale.
 # Supported forms: a single number (fixed), a list (per-frame),
 # {"mode": "linear", "start": a, "end": b}, {"mode": "random", "min": a, "max": b}.
-STRENGTH_SCHEDULE = {"mode": "linear", "start": 0.1, "end": 0.8} # img2img denoising strength
-# STRENGTH_SCHEDULE = 0.5 # fixed img2img denoising strength
+# STRENGTH_SCHEDULE = {"mode": "linear", "start": 0.2, "end": 1.0} # img2img denoising strength
+STRENGTH_SCHEDULE = 0.4 # fixed img2img denoising strength
 
 CONDITIONING_SCHEDULE = 1.0 # Controlnet Conditioning Strength
 
 # Output resolution (must be multiples of 8).
-# IMAGE_SIZE = (1216, 704)
-IMAGE_SIZE = (1024, 1024)
+# IMAGE_SIZE = (1920, 1080)
+IMAGE_SIZE = (1360, 768)
+# IMAGE_SIZE = (1280, 720)
+# IMAGE_SIZE = (1024, 1024) # SDXL was trained on 1024x1024 images, its best to keep it around 1m pixels
 
 # Output locations.
 OUTPUT_ROOT = Path("media/videos")
 RUN_NAME = None  # If None, auto-increments runX
 
 # Video settings.
-FPS = 10
+FPS = 2
 VIDEO_FILENAME = "video.mp4"
+
+# Optional upscaling.
+UPSCALE = True
+UPSCALE_SIZE = (1920, 1080)
 
 # Canny edge detector thresholds.
 CANNY_LOW = 100
@@ -108,9 +117,33 @@ def resize_image(img, size):
 	return img.resize(size, Image.LANCZOS)
 
 
+def resize_cover_crop(img, target_size):
+	tw, th = target_size
+	w, h = img.size
+	scale = max(tw / w, th / h)
+	resized = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+	rw, rh = resized.size
+	left = max((rw - tw) // 2, 0)
+	top = max((rh - th) // 2, 0)
+	return resized.crop((left, top, left + tw, top + th))
+
+
+def resize_contain_pad(img, target_size, fill=(0, 0, 0)):
+	tw, th = target_size
+	w, h = img.size
+	scale = min(1.0, min(tw / w, th / h))
+	new_w, new_h = int(w * scale), int(h * scale)
+	resized = img.resize((new_w, new_h), Image.LANCZOS)
+	canvas = Image.new("RGB", (tw, th), fill)
+	left = (tw - new_w) // 2
+	top = (th - new_h) // 2
+	canvas.paste(resized, (left, top))
+	return canvas
+
+
 def prepare_init_image(path, size):
 	raw = load_image_rgb(path)
-	resized = resize_image(raw, size)
+	resized = resize_cover_crop(raw, size)
 	return raw, resized
 
 
@@ -124,10 +157,12 @@ def prepare_control_image_cached(
 ):
 	cache_dir.mkdir(parents=True, exist_ok=True)
 	raw = load_image_rgb(path)
-	resized = resize_image(raw, size)
+	resized = resize_contain_pad(raw, size)
 	cache_path = cache_dir / path.name
 	if cache_path.exists():
-		canny_img = load_image_rgb(cache_path).resize(size, Image.LANCZOS)
+		canny_img = load_image_rgb(cache_path)
+		if canny_img.size != size:
+			canny_img = resize_contain_pad(canny_img, size)
 	else:
 		canny = cv2_canny(resized, low, high)
 		canny_img = Image.fromarray(canny)
@@ -227,8 +262,11 @@ def main():
 
 	run_dir, run_num = next_run_dir(OUTPUT_ROOT, RUN_NAME)
 	frames_dir = run_dir / "frames"
+	pre_upscale_dir = run_dir / "pre-upscale" if UPSCALE else None
 	inputs_dir = run_dir / "inputs"
 	frames_dir.mkdir(parents=True, exist_ok=True)
+	if pre_upscale_dir:
+		pre_upscale_dir.mkdir(parents=True, exist_ok=True)
 	inputs_dir.mkdir(parents=True, exist_ok=True)
 
 	control_path = Path(CONTROL_IMAGE)
@@ -241,8 +279,8 @@ def main():
 	pipe = load_pipeline(device=DEVICE, torch_dtype=TORCH_DTYPE)
 	generator = torch.Generator(device=DEVICE).manual_seed(SEED)
 
-	gen_times = []
 	saved_inputs = set()
+	gen_times = []
 	t0_total = time.time()
 
 	for idx, init_path in enumerate(init_sequence):
@@ -272,20 +310,49 @@ def main():
 
 		out_image = result.images[0]
 		frame_path = frames_dir / f"frame_{idx:05d}.png"
-		out_image.save(frame_path)
+
+		if UPSCALE and pre_upscale_dir:
+			pre_path = pre_upscale_dir / f"frame_{idx:05d}.png"
+			out_image.save(pre_path)
+			saved_path = pre_path
+		else:
+			out_image.save(frame_path)
+			saved_path = frame_path
+
 		avg_time = sum(gen_times) / len(gen_times)
 		remaining_time = avg_time * (frame_count - idx - 1)
 		print(
-			f"[{idx + 1}/{frame_count}] saved {frame_path} in {duration:.2f}s "
+			f"[{idx + 1}/{frame_count}] saved {saved_path} in {duration:.2f}s "
 			f"(avg {avg_time:.2f}s, remaining {format_duration(remaining_time)}) | "
 			f"strength={strength:.3f}, cond={conditioning_scale:.3f}"
 		)
 
-	total = time.time() - t0_total
-	avg = sum(gen_times) / len(gen_times) if gen_times else 0.0
+	if UPSCALE and pre_upscale_dir:
+		del pipe
+		torch.cuda.empty_cache()
+		upscaler = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+			"stabilityai/stable-diffusion-xl-base-1.0",
+			torch_dtype=torch.float16,
+			use_safetensors=True,
+			vae=AutoencoderKL.from_pretrained("stabilityai/sdxl-vae", torch_dtype=torch.float16),
+		).to(DEVICE)
+		upscaler.enable_xformers_memory_efficient_attention()
+		for pre_path in sorted(pre_upscale_dir.glob("frame_*.png")):
+			base_image = Image.open(pre_path)
+			upscaled = upscaler(
+				prompt=PROMPT,
+				image=base_image.resize(UPSCALE_SIZE, Image.Resampling.LANCZOS),
+				strength=0.28,
+				guidance_scale=2.5,
+				num_inference_steps=12,
+			).images[0]
+			upscaled.save(frames_dir / pre_path.name)
 
 	video_path = run_dir / VIDEO_FILENAME
 	stitch_video(frames_dir, video_path, FPS)
+
+	total = time.time() - t0_total
+	avg = sum(gen_times) / len(gen_times) if gen_times else 0.0
 
 	summary = {
 		"mode": mode,
@@ -306,6 +373,8 @@ def main():
 		"schedule_seed": SCHEDULE_SEED,
 		"device": DEVICE,
 		"dtype": str(TORCH_DTYPE),
+		"upscale": UPSCALE,
+		"upscale_size": UPSCALE_SIZE if UPSCALE else None,
 		"total_time_sec": total,
 		"avg_time_sec": avg,
 	}
