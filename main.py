@@ -26,17 +26,18 @@ from experiments import load_pipeline
 # One image path, a list of paths, or a directory. If it resolves to multiple
 # images, the run cycles through them for however many frames you request.
 # If it resolves to one image, the run reuses it for ``NUM_FRAMES`` frames.
-INPUTS = "media/inputs/google-earth"
+# This is the 'background image'
+INPUT = "media/inputs/google-earth"
 
-# Single control/canny image path.
-CONTROL_IMAGE = "media/inputs/canny/gingko.jpg"
+# Single control/canny image or video path which is passed to the ControlNet
+CONTROL = "media/inputs/circle.mp4"
 
 # Total frames to generate (applies to both single-image and folder modes).
-NUM_FRAMES = 8
+NUM_FRAMES = 20
 # google_earth has 88 images
 
 # Prompt settings.
-PROMPT = "highly detailed satellite image with the outline of a gingko leaf in the center"
+PROMPT = "highly detailed satellite image"
 NEGATIVE_PROMPT = "low quality, blurry, distorted"
 NUM_INFERENCE_STEPS = 30
 GUIDANCE_SCALE = 4.0
@@ -51,9 +52,9 @@ CONDITIONING_SCHEDULE = 1.0 # Controlnet Conditioning Strength
 
 # Output resolution (must be multiples of 8).
 # IMAGE_SIZE = (1920, 1080)
-IMAGE_SIZE = (1360, 768)
+# IMAGE_SIZE = (1360, 768)
 # IMAGE_SIZE = (1280, 720)
-# IMAGE_SIZE = (1024, 1024) # SDXL was trained on 1024x1024 images, its best to keep it around 1m pixels
+IMAGE_SIZE = (1024, 1024) # SDXL was trained on 1024x1024 images, its best to keep it around 1m pixels
 
 # Output locations.
 OUTPUT_ROOT = Path("media/videos")
@@ -64,7 +65,7 @@ FPS = 2
 VIDEO_FILENAME = "video.mp4"
 
 # Optional upscaling.
-UPSCALE = True
+UPSCALE = False
 UPSCALE_SIZE = (1920, 1080)
 
 # Canny edge detector thresholds.
@@ -113,6 +114,27 @@ def load_image_rgb(path):
 	return Image.open(path).convert("RGB")
 
 
+def is_video_file(path):
+	return Path(path).suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+
+
+def load_video_frames(path):
+	cap = cv2.VideoCapture(str(path))
+	if not cap.isOpened():
+		raise ValueError(f"Could not open video: {path}")
+	frames = []
+	while True:
+		ret, frame = cap.read()
+		if not ret:
+			break
+		frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+		frames.append(Image.fromarray(frame))
+	cap.release()
+	if not frames:
+		raise ValueError(f"No frames found in video: {path}")
+	return frames
+
+
 def resize_image(img, size):
 	return img.resize(size, Image.LANCZOS)
 
@@ -147,27 +169,39 @@ def prepare_init_image(path, size):
 	return raw, resized
 
 
-def prepare_control_image_cached(
-	path,
-	size,
-	low,
-	high,
-	cache_dir,
-
-):
+def prepare_control_assets(control, size, low, high, cache_dir):
 	cache_dir.mkdir(parents=True, exist_ok=True)
-	raw = load_image_rgb(path)
-	resized = resize_contain_pad(raw, size)
-	cache_path = cache_dir / path.name
-	if cache_path.exists():
-		canny_img = load_image_rgb(cache_path)
-		if canny_img.size != size:
-			canny_img = resize_contain_pad(canny_img, size)
+	control_path = Path(control)
+	if is_video_file(control_path):
+		raw_frames = load_video_frames(control_path)
+	elif control_path.is_dir():
+		control_files = expand_input_entry(control_path)
+		raw_frames = [load_image_rgb(p) for p in control_files]
 	else:
-		canny = cv2_canny(resized, low, high)
-		canny_img = Image.fromarray(canny)
-		canny_img.save(cache_path)
-	return raw, resized, canny_img, cache_path
+		raw_frames = [load_image_rgb(control_path)]
+
+	if not raw_frames:
+		raise ValueError(f"No control frames found in: {control_path}")
+
+	canny_frames = []
+	for idx, frame in enumerate(raw_frames):
+		resized = resize_contain_pad(frame, size)
+		canny_img = None
+		if not is_video_file(control_path) and not control_path.is_dir():
+			cache_path = cache_dir / control_path.name
+			if cache_path.exists():
+				cached = load_image_rgb(cache_path)
+				canny_img = cached if cached.size == size else resize_contain_pad(cached, size)
+		if canny_img is None:
+			canny_img = Image.fromarray(cv2_canny(resized, low, high))
+			if not is_video_file(control_path) and not control_path.is_dir():
+				canny_img.save(cache_dir / control_path.name)
+		if idx == 0:
+			frame.save(cache_dir / "raw_control_frame0.png")
+			resized.save(cache_dir / "resized_control_frame0.png")
+			canny_img.save(cache_dir / "canny_control_frame0.png")
+		canny_frames.append(canny_img)
+	return canny_frames, str(control_path)
 
 
 def cv2_canny(img, low, high):
@@ -239,7 +273,7 @@ def write_summary(path, summary):
 def main():
 	ensure_size_multiple_of_8(IMAGE_SIZE)
 
-	resolved_inputs = resolve_inputs(INPUTS)
+	resolved_inputs = resolve_inputs(INPUT)
 	if not resolved_inputs:
 		raise ValueError("No input images found.")
 
@@ -269,12 +303,10 @@ def main():
 		pre_upscale_dir.mkdir(parents=True, exist_ok=True)
 	inputs_dir.mkdir(parents=True, exist_ok=True)
 
-	control_path = Path(CONTROL_IMAGE)
-	ctrl_raw, ctrl_resized, control_image, cached_canny_path = prepare_control_image_cached(
+	control_path = Path(CONTROL)
+	control_canny_frames, control_ref = prepare_control_assets(
 		control_path, IMAGE_SIZE, CANNY_LOW, CANNY_HIGH, inputs_dir
 	)
-	ctrl_raw.save(inputs_dir / f"raw_control_{control_path.stem}.png")
-	ctrl_resized.save(inputs_dir / f"resized_control_{control_path.stem}.png")
 
 	pipe = load_pipeline(device=DEVICE, torch_dtype=TORCH_DTYPE)
 	generator = torch.Generator(device=DEVICE).manual_seed(SEED)
@@ -298,7 +330,7 @@ def main():
 			prompt=PROMPT,
 			negative_prompt=NEGATIVE_PROMPT,
 			image=init_resized,
-			control_image=control_image,
+			control_image=control_canny_frames[idx % len(control_canny_frames)],
 			num_inference_steps=NUM_INFERENCE_STEPS,
 			guidance_scale=GUIDANCE_SCALE,
 			strength=strength,
@@ -359,7 +391,7 @@ def main():
 		"run_dir": str(run_dir),
 		"frames": frame_count,
 		"input_files": [str(p) for p in resolved_inputs],
-		"control_image": str(control_path),
+		"control": control_ref,
 		"prompt": PROMPT,
 		"negative_prompt": NEGATIVE_PROMPT,
 		"num_inference_steps": NUM_INFERENCE_STEPS,
