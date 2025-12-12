@@ -10,19 +10,19 @@ Example of combining two still images:
 
 <div align="center" style="display:flex; flex-wrap:wrap; gap:18px; justify-content:center;">
   <figure style="margin:0;">
-    <img src="media/videos/run14/inputs/resized_input_download-6.png" alt="Background" width="220" />
+    <img src="assets/background.png" alt="Background" width="220" />
     <figcaption>Background</figcaption>
   </figure>
   <figure style="margin:0;">
-    <img src="media/inputs/gingko.jpg" alt="Control drawing" width="220" />
+    <img src="assets/gingko.png" alt="Control drawing" width="220" />
     <figcaption>Control drawing</figcaption>
   </figure>
   <figure style="margin:0;">
-    <img src="media/videos/run14/inputs/raw_control_gingko.png" alt="Canny (ControlNet input)" width="220" />
+    <img src="assets/gingko_canny.jpg" alt="Canny (ControlNet input)" width="220" />
     <figcaption>Canny (ControlNet input)</figcaption>
   </figure>
   <figure style="margin:0;">
-    <img src="media/videos/run14/frames/frame_00039.png" alt="Result" width="220" />
+    <img src="assets/output.png" alt="Result" width="220" />
     <figcaption>Result</figcaption>
   </figure>
 </div>
